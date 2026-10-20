@@ -1,0 +1,27 @@
+{
+  "user_report": "done, this worked so much better",
+  "normal_shutdown": true,
+  "gpu_error_lines": [],
+  "peak_game_footprint_gib": 11.168100602924824,
+  "max_system_wired_gib": 11.96173095703125,
+  "traced_large_temporary_backing_gib": 4.078125,
+  "max_metal_allocated_bytes": 10592010240,
+  "presentation_submissions_per_second_in_order": [
+    3.5,
+    31.17,
+    59.43,
+    61.51,
+    58.88,
+    51.81,
+    40.53,
+    32.25,
+    30.7,
+    27.31,
+    27.82,
+    24.42,
+    25.67,
+    27.06
+  ],
+  "note": "Successful queue-present completion throughput, not independently measured displayed FPS; trace mode logs resources >=1MiB.",
+  "game_version": "ef984944dc330a30f175adaa897d05c7c7ff9ea0"
+}

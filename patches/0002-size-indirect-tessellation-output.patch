@@ -1,0 +1,159 @@
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -17,6 +17,10 @@
+  */
+ 
+ #include "MVKPipeline.h"
++#include "../Utility/MVKTessOutputStride.h"
++#include <unordered_map>
++#include <mutex>
++#include <cstdio>
+ #include "MVKCommandBuffer.h"
+ #include "MVKInlineObjectConstructor.h"
+ #include "MVKImage.h"
+@@ -42,6 +46,58 @@
+ using namespace std;
+ using namespace mvk;
+ using namespace SPIRV_CROSS_NAMESPACE;
++
++// Optional tessellation scratch sizing from the compiled Metal argument layout.
++namespace {
++struct MVKReflectedBufferStride { NSUInteger bytes; bool logged; };
++std::mutex tessStrideLock;
++struct MVKReflectedState { std::unordered_map<NSUInteger, MVKReflectedBufferStride> buffers; size_t owners=0; };
++std::unordered_map<id<MTLComputePipelineState>, MVKReflectedState> tessBufferStrides;
++}
++bool mvkReflectTessOutputStridesEnabled() {
++    static const bool enabled=[](){const char* e=getenv("MVK_DIAG_REFLECT_TESS_OUTPUT_STRIDES");return e&&atoi(e)!=0;}();
++    return enabled;
++}
++void mvkRememberComputeBufferStrides(id<MTLComputePipelineState> state, MTLComputePipelineReflection* reflection) {
++    if(!mvkReflectTessOutputStridesEnabled() || !state)return;
++    std::unordered_map<NSUInteger, MVKReflectedBufferStride> strides;
++    for(MTLArgument* arg in reflection.arguments) {
++        if(arg.type==MTLArgumentTypeBuffer && arg.bufferDataSize>0) {
++            NSUInteger alignment=std::max<NSUInteger>(arg.bufferAlignment,1);
++            NSUInteger size=arg.bufferDataSize;
++            if(size<=NSUIntegerMax-(alignment-1)) {
++                size=((size+alignment-1)/alignment)*alignment;
++                strides[arg.index]={size,false};
++            }
++        }
++    }
++    std::lock_guard<std::mutex> guard(tessStrideLock);
++    // Every new state replaces an entry, including an empty one on missing reflection.
++    // This prevents stale metadata when an Objective-C object address is reused.
++    auto& entry=tessBufferStrides[state];
++    entry.buffers=std::move(strides);
++    ++entry.owners;
++}
++void mvkForgetComputeBufferStrides(id<MTLComputePipelineState> state) {
++    if(!mvkReflectTessOutputStridesEnabled() || !state)return;
++    std::lock_guard<std::mutex> guard(tessStrideLock);
++    auto it=tessBufferStrides.find(state);
++    if(it!=tessBufferStrides.end() && --it->second.owners==0)tessBufferStrides.erase(it);
++}
++NSUInteger mvkTessOutputStride(id<MTLComputePipelineState> state, NSUInteger index, NSUInteger fallback) {
++    if(!mvkReflectTessOutputStridesEnabled())return fallback;
++    std::lock_guard<std::mutex> guard(tessStrideLock);
++    auto it=tessBufferStrides.find(state);
++    if(it==tessBufferStrides.end())return fallback;
++    auto entry=it->second.buffers.find(index);
++    if(entry==it->second.buffers.end())return fallback;
++    if(!entry->second.logged) {
++        fprintf(stderr,"[enshrouded-diag] Tessellation output stride: state=%p buffer=%lu legacy=%lu reflected=%lu.\n",(void*)state,(unsigned long)index,(unsigned long)fallback,(unsigned long)entry->second.bytes);
++        entry->second.logged=true;
++    }
++    return entry->second.bytes;
++}
++
+ 
+ 
+ #pragma mark - MVKPipelineLayout
+@@ -2323,9 +2379,13 @@
+ 
+ MVKGraphicsPipeline::~MVKGraphicsPipeline() {
+ 	@synchronized (getMTLDevice()) {
++		mvkForgetComputeBufferStrides(_mtlTessVertexStageState);
+ 		[_mtlTessVertexStageState release];
++		mvkForgetComputeBufferStrides(_mtlTessVertexStageIndex16State);
+ 		[_mtlTessVertexStageIndex16State release];
++		mvkForgetComputeBufferStrides(_mtlTessVertexStageIndex32State);
+ 		[_mtlTessVertexStageIndex32State release];
++		mvkForgetComputeBufferStrides(_mtlTessControlStageState);
+ 		[_mtlTessControlStageState release];
+ 		[_mtlPipelineState release];
+ 		if (_ownsVertexModule) delete _vertexModule;
+@@ -2486,6 +2546,7 @@
+ }
+ 
+ MVKComputePipeline::~MVKComputePipeline() {
++    mvkForgetComputeBufferStrides(_mtlPipelineState);
+ 	@synchronized (getMTLDevice()) {
+ 		[_mtlPipelineState release];
+ 		if (_ownsModule) delete _module;
+@@ -3066,8 +3127,9 @@
+ 		auto mtlDev = getMTLDevice();
+ 		@synchronized (mtlDev) {
+ 			[mtlDev newComputePipelineStateWithDescriptor: plDesc
+-												  options: MTLPipelineOptionNone
+-										completionHandler: ^(id<MTLComputePipelineState> ps, MTLComputePipelineReflection*, NSError* error) {
++												  options: (mvkReflectTessOutputStridesEnabled() ? MTLPipelineOptionArgumentInfo | MTLPipelineOptionBufferTypeInfo : MTLPipelineOptionNone)
++										completionHandler: ^(id<MTLComputePipelineState> ps, MTLComputePipelineReflection* reflection, NSError* error) {
++                                            mvkRememberComputeBufferStrides(ps, reflection);
+ 											bool isLate = compileComplete(ps, error);
+ 											if (isLate) { destroy(); }
+ 										}];
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+@@ -17,6 +17,7 @@
+  */
+ 
+ #include "MVKCmdDraw.h"
++#include "../Utility/MVKTessOutputStride.h"
+ #include "MVKCommandBuffer.h"
+ #include "MVKCommandPool.h"
+ #include "MVKBuffer.h"
+@@ -945,13 +946,13 @@
+ 		tcParamsBuff = cmdEncoder->getTempMTLBuffer(paramsSize, true);
+         mtlParmBuffOfst = tcParamsBuff->_offset;
+         if (pipeline->needsVertexOutputBuffer()) {
+-            vtxOutBuff = cmdEncoder->getTempMTLBuffer(vertexCount * 4 * dvcLimits.maxVertexOutputComponents, true);
++            vtxOutBuff = cmdEncoder->getTempMTLBuffer((NSUInteger)vertexCount * mvkTessOutputStride(pipeline->getTessVertexStageState(), pipeline->getImplicitBuffers(kMVKShaderStageVertex).ids[MVKImplicitBuffer::Output], 4 * dvcLimits.maxVertexOutputComponents), true);
+         }
+         if (pipeline->needsTessCtlOutputBuffer()) {
+-            tcOutBuff = cmdEncoder->getTempMTLBuffer(outControlPointCount * patchCount * 4 * dvcLimits.maxTessellationControlPerVertexOutputComponents, true);
++            tcOutBuff = cmdEncoder->getTempMTLBuffer((NSUInteger)outControlPointCount * patchCount * mvkTessOutputStride(pipeline->getTessControlStageState(), pipeline->getImplicitBuffers(kMVKShaderStageTessCtl).ids[MVKImplicitBuffer::Output], 4 * dvcLimits.maxTessellationControlPerVertexOutputComponents), true);
+         }
+         if (pipeline->needsTessCtlPatchOutputBuffer()) {
+-            tcPatchOutBuff = cmdEncoder->getTempMTLBuffer(patchCount * 4 * dvcLimits.maxTessellationControlPerPatchOutputComponents, true);
++            tcPatchOutBuff = cmdEncoder->getTempMTLBuffer((NSUInteger)patchCount * mvkTessOutputStride(pipeline->getTessControlStageState(), pipeline->getImplicitBuffers(kMVKShaderStageTessCtl).ids[MVKImplicitBuffer::PatchOutput], 4 * dvcLimits.maxTessellationControlPerPatchOutputComponents), true);
+         }
+         tcLevelBuff = cmdEncoder->getTempMTLBuffer(patchCount * sizeof(MTLQuadTessellationFactorsHalf), true);
+ 
+@@ -1311,13 +1312,13 @@
+         tcParamsBuff = cmdEncoder->getTempMTLBuffer(paramsSize, true);
+         mtlParmBuffOfst = tcParamsBuff->_offset;
+         if (pipeline->needsVertexOutputBuffer()) {
+-            vtxOutBuff = cmdEncoder->getTempMTLBuffer(vertexCount * 4 * dvcLimits.maxVertexOutputComponents, true);
++            vtxOutBuff = cmdEncoder->getTempMTLBuffer((NSUInteger)vertexCount * mvkTessOutputStride((ibb.mtlIndexType == MTLIndexTypeUInt16 ? pipeline->getTessVertexStageIndex16State() : pipeline->getTessVertexStageIndex32State()), pipeline->getImplicitBuffers(kMVKShaderStageVertex).ids[MVKImplicitBuffer::Output], 4 * dvcLimits.maxVertexOutputComponents), true);
+         }
+         if (pipeline->needsTessCtlOutputBuffer()) {
+-            tcOutBuff = cmdEncoder->getTempMTLBuffer(outControlPointCount * patchCount * 4 * dvcLimits.maxTessellationControlPerVertexOutputComponents, true);
++            tcOutBuff = cmdEncoder->getTempMTLBuffer((NSUInteger)outControlPointCount * patchCount * mvkTessOutputStride(pipeline->getTessControlStageState(), pipeline->getImplicitBuffers(kMVKShaderStageTessCtl).ids[MVKImplicitBuffer::Output], 4 * dvcLimits.maxTessellationControlPerVertexOutputComponents), true);
+         }
+         if (pipeline->needsTessCtlPatchOutputBuffer()) {
+-            tcPatchOutBuff = cmdEncoder->getTempMTLBuffer(patchCount * 4 * dvcLimits.maxTessellationControlPerPatchOutputComponents, true);
++            tcPatchOutBuff = cmdEncoder->getTempMTLBuffer((NSUInteger)patchCount * mvkTessOutputStride(pipeline->getTessControlStageState(), pipeline->getImplicitBuffers(kMVKShaderStageTessCtl).ids[MVKImplicitBuffer::PatchOutput], 4 * dvcLimits.maxTessellationControlPerPatchOutputComponents), true);
+         }
+         tcLevelBuff = cmdEncoder->getTempMTLBuffer(patchCount * sizeof(MTLQuadTessellationFactorsHalf), true);
+         vtxIndexBuff = cmdEncoder->getTempMTLBuffer(ibb.size, true);
+--- /dev/null
++++ b/MoltenVK/MoltenVK/Utility/MVKTessOutputStride.h
+@@ -0,0 +1,6 @@
++#pragma once
++#include <Metal/Metal.h>
++bool mvkReflectTessOutputStridesEnabled();
++void mvkRememberComputeBufferStrides(id<MTLComputePipelineState> state, MTLComputePipelineReflection* reflection);
++void mvkForgetComputeBufferStrides(id<MTLComputePipelineState> state);
++NSUInteger mvkTessOutputStride(id<MTLComputePipelineState> state, NSUInteger index, NSUInteger fallback);
